@@ -47,6 +47,7 @@
 
 #define __USE_GNU 1 /* shouldn't be done, yet it is */
 #include <pthread.h>
+#define USE_CLI 1
 
 static int      first_use = 1;
 static uint64_t StartingTime;
@@ -533,55 +534,7 @@ strnicmp(const char *s1, const char *s2, size_t n)
 void
 main_thread(void *param)
 {
-    uint32_t old_time;
-    uint32_t new_time;
-    int      drawits;
-    int      frames;
 
-    SDL_SetThreadPriority(SDL_THREAD_PRIORITY_HIGH);
-    framecountx = 0;
-    // title_update = 1;
-    old_time = SDL_GetTicks();
-    drawits = frames = 0;
-    while (!is_quit && cpu_thread_run) {
-        /* See if it is time to run a frame of code. */
-        new_time = SDL_GetTicks();
-#ifdef USE_GDBSTUB
-        if (gdbstub_next_asap && (drawits <= 0))
-            drawits = 10;
-        else
-#endif
-            drawits += (new_time - old_time);
-        old_time = new_time;
-        if (drawits > 0 && !dopause) {
-            /* Yes, so do one frame now. */
-            drawits -= 10;
-            if (drawits > 50)
-                drawits = 0;
-
-            /* Run a block of code. */
-            pc_run();
-
-            /* Every 200 frames we save the machine status. */
-            if (++frames >= 200 && nvr_dosave) {
-                nvr_save();
-                nvr_dosave = 0;
-                frames     = 0;
-            }
-        } else /* Just so we dont overload the host OS. */
-            SDL_Delay(1);
-
-        /* If needed, handle a screen resize. */
-        if (atomic_load(&doresize_monitors[0]) && !video_fullscreen && !is_quit) {
-            if (vid_resize & 2)
-                plat_resize(fixed_size_x, fixed_size_y, 0);
-            else
-                plat_resize(scrnsz_x, scrnsz_y, 0);
-            atomic_store(&doresize_monitors[0], 1);
-        }
-    }
-
-    is_quit = 1;
 }
 
 thread_t *thMain = NULL;
@@ -1223,13 +1176,56 @@ main(int argc, char **argv)
 
     /* Initialize the rendering window, or fullscreen. */
 
-    do_start();
+    /* We have not stopped yet. */
+    is_quit = 0;
+
+    /* Initialize the high-precision timer. */
+    SDL_InitSubSystem(SDL_INIT_TIMER);
+    timer_freq = SDL_GetPerformanceFrequency();
+
 #ifndef USE_CLI
     thread_create(monitor_thread, NULL);
 #endif
-    SDL_AddTimer(1000, timer_onesec, NULL);
+
+    uint32_t old_time = SDL_GetTicks();
+    uint32_t new_time;
+    uint32_t delta_time;
+    int      frames = 0;
+
     while (!is_quit) {
         static int mouse_inside = 0;
+
+        // framecountx = 0;
+        new_time = SDL_GetTicks();
+            
+        delta_time = (new_time - old_time);
+        old_time = new_time;
+        if (delta_time > 0 && !dopause) {
+            /* Yes, so do one frame now. */
+            if (delta_time > 50) {
+                delta_time = 50;
+            }
+
+            /* Run a block of code. */
+            pc_run(delta_time); // TODO: give delta_time as argument
+
+            /* Every 200 frames we save the machine status. */
+            if (++frames >= 200 && nvr_dosave) {
+                nvr_save();
+                nvr_dosave = 0;
+                frames     = 0;
+            }
+        } else /* Just so we dont overload the host OS. */
+            SDL_Delay(1);
+
+        /* If needed, handle a screen resize. */
+        if (atomic_load(&doresize_monitors[0]) && !video_fullscreen && !is_quit) {
+            if (vid_resize & 2)
+                plat_resize(fixed_size_x, fixed_size_y, 0);
+            else
+                plat_resize(scrnsz_x, scrnsz_y, 0);
+            atomic_store(&doresize_monitors[0], 1);
+        }
 
         while (SDL_PollEvent(&event)) {
             switch (event.type) {
@@ -1337,10 +1333,10 @@ main(int argc, char **argv)
         if (mouse_capture && keyboard_ismsexit()) {
             plat_mouse_capture(0);
         }
-        if (blitreq) {
+        // if (blitreq) {
             extern void sdl_blit(int x, int y, int w, int h);
             sdl_blit(params.x, params.y, params.w, params.h);
-        }
+        // }
         if (title_set) {
             extern void ui_window_title_real(void);
             ui_window_title_real();

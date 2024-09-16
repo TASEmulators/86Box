@@ -1409,7 +1409,7 @@ ack_pause(void)
 }
 
 void
-pc_run(void)
+pc_run(uint32_t ms)
 {
     int     mouse_msg_idx;
     wchar_t temp[200];
@@ -1422,8 +1422,9 @@ pc_run(void)
     }
 
     /* Run a block of code. */
+    uint32_t cycles_to_run = ((uint64_t)ms * cpu_s->rspeed) / 1000ULL;
     startblit();
-    cpu_exec((int32_t) cpu_s->rspeed / 100);
+    cpu_exec(cycles_to_run);
     ack_pause();
 #ifdef USE_GDBSTUB /* avoid a KBC FIFO overflow when CPU emulation is stalled */
     if (gdbstub_step == GDBSTUB_EXEC) {
@@ -1437,8 +1438,9 @@ pc_run(void)
     endblit();
 
     /* Done with this frame, update statistics. */
+    framecountx+=ms;
     framecount++;
-    if (++framecountx >= 100) {
+    if (framecountx >= 1000) {
         framecountx = 0;
         frames      = 0;
     }
