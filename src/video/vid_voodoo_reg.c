@@ -103,13 +103,10 @@ voodoo_reg_writel(uint32_t addr, uint32_t val, void *priv)
                 voodoo_reg_log("swapbufferCMD %08x %08x\n", val, voodoo->leftOverlayBuf);
 #endif
 
-                voodoo_wait_for_render_thread_idle(voodoo);
                 if (!(val & 1)) {
                     banshee_set_overlay_addr(voodoo->priv, voodoo->leftOverlayBuf);
-                    thread_wait_mutex(voodoo->swap_mutex);
                     if (voodoo->swap_count > 0)
                         voodoo->swap_count--;
-                    thread_release_mutex(voodoo->swap_mutex);
                     voodoo->frame_count++;
                 } else if (TRIPLE_BUFFER) {
                     if (voodoo->swap_pending)
@@ -144,14 +141,11 @@ voodoo_reg_writel(uint32_t addr, uint32_t val, void *priv)
             voodoo_reg_log("Swap buffer %08x %d %p %i\n", val, voodoo->swap_count, &voodoo->swap_count, (voodoo == voodoo->set->voodoos[1]) ? 1 : 0);
             voodoo->front_offset = params->front_offset;
 #endif
-            voodoo_wait_for_render_thread_idle(voodoo);
             if (!(val & 1)) {
                 memset(voodoo->dirty_line, 1, sizeof(voodoo->dirty_line));
                 voodoo->front_offset = voodoo->params.front_offset;
-                thread_wait_mutex(voodoo->swap_mutex);
                 if (voodoo->swap_count > 0)
                     voodoo->swap_count--;
-                thread_release_mutex(voodoo->swap_mutex);
             } else if (TRIPLE_BUFFER) {
                 if (voodoo->swap_pending)
                     voodoo_wait_for_swap_complete(voodoo);
@@ -590,7 +584,6 @@ voodoo_reg_writel(uint32_t addr, uint32_t val, void *priv)
             voodoo->fbiPixelsOut  = 0;
             break;
         case SST_fastfillCMD:
-            voodoo_wait_for_render_thread_idle(voodoo);
             voodoo_fastfill(voodoo, &voodoo->params);
             voodoo->cmd_read++;
             break;

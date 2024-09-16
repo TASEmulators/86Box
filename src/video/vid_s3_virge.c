@@ -71,21 +71,6 @@ static int dither[4][4] = {
 #define ROM_DIAMOND_STEALTH3D_4000    "roms/video/s3virge/DS3D4K v1.03 Brightness bug fix.bin"
 #define ROM_TRIO3D2X                  "roms/video/s3virge/TRIO3D2X_8mbsdr.VBI"
 
-#define RB_SIZE 256
-#define RB_MASK (RB_SIZE - 1)
-
-#define RB_ENTRIES (virge->s3d_write_idx - virge->s3d_read_idx)
-#define RB_FULL (RB_ENTRIES == RB_SIZE)
-#define RB_EMPTY (!RB_ENTRIES)
-
-#define FIFO_SIZE 65536
-#define FIFO_MASK (FIFO_SIZE - 1)
-#define FIFO_ENTRY_SIZE (1 << 31)
-
-#define FIFO_ENTRIES (virge->fifo_write_idx - virge->fifo_read_idx)
-#define FIFO_FULL ((virge->fifo_write_idx - virge->fifo_read_idx) >= FIFO_SIZE)
-#define FIFO_EMPTY (virge->fifo_read_idx == virge->fifo_write_idx)
-
 #define FIFO_TYPE 0xff000000
 #define FIFO_ADDR 0x00ffffff
 
@@ -220,11 +205,6 @@ typedef struct virge_t {
     int           pixel_count;
     int           tri_count;
 
-    thread_t *    render_thread;
-    event_t *     wake_render_thread;
-    event_t *     wake_main_thread;
-    event_t *     not_full_event;
-
     uint32_t      hwc_fg_col;
     uint32_t      hwc_bg_col;
     int           hwc_col_stack_pos;
@@ -287,11 +267,6 @@ typedef struct virge_t {
 
     s3d_t        s3d_tri;
 
-    s3d_t        s3d_buffer[RB_SIZE];
-    atomic_int   s3d_read_idx;
-    atomic_int   s3d_write_idx;
-    atomic_int   s3d_busy;
-
     struct {
         uint32_t pri_ctrl;
         uint32_t chroma_ctrl;
@@ -328,16 +303,6 @@ typedef struct virge_t {
         int      sec_w;
         int      sec_h;
     } streams;
-
-    fifo_entry_t fifo[FIFO_SIZE];
-    atomic_int   fifo_read_idx, fifo_write_idx;
-    atomic_int   fifo_thread_run, render_thread_run;
-
-    thread_t *   fifo_thread;
-    event_t      *wake_fifo_thread;
-    event_t *    fifo_not_full_event;
-
-    atomic_int   virge_busy;
 
     uint8_t      subsys_stat;
     uint8_t      subsys_cntl;
@@ -376,12 +341,6 @@ typedef struct virge_t {
     int          pci;
     int          is_agp;
 } virge_t;
-
-static __inline void
-wake_fifo_thread(virge_t *virge) {
-    /* Wake up FIFO thread if moving from idle */
-    thread_set_event(virge->wake_fifo_thread);
-}
 
 static virge_t         *reset_state = NULL;
 
@@ -1105,10 +1064,6 @@ s3_virge_vblank_start(svga_t *svga) {
 
 static void
 s3_virge_wait_fifo_idle(virge_t *virge) {
-    while (!FIFO_EMPTY) {
-        wake_fifo_thread(virge);
-        thread_wait_event(virge->fifo_not_full_event, 1);
-    }
 }
 
 static uint8_t
@@ -1119,20 +1074,12 @@ s3_virge_mmio_read(uint32_t addr, void *priv)
 
     switch (addr & 0xffff) {
         case 0x8504:
-            if (!virge->virge_busy)
-                wake_fifo_thread(virge);
-
             ret = virge->subsys_stat;
             return ret;
         case 0x8505:
             ret = 0xc0;
-            if (virge->s3d_busy || virge->virge_busy || !FIFO_EMPTY)
-                ret |= 0x10;
-            else
-                ret |= 0x30;
+            ret |= 0x30;
 
-            if (!virge->virge_busy)
-                wake_fifo_thread(virge);
             return ret;
 
         case 0x850c:
@@ -1171,14 +1118,9 @@ s3_virge_mmio_read_w(uint32_t addr, void *priv)
     switch (addr & 0xfffe) {
         case 0x8504:
             ret = 0xc000;
-            if (virge->s3d_busy || virge->virge_busy || !FIFO_EMPTY)
-                ret |= 0x1000;
-            else
-                ret |= 0x3000;
+            ret |= 0x3000;
 
             ret |= virge->subsys_stat;
-            if (!virge->virge_busy)
-                wake_fifo_thread(virge);
             return ret;
 
         case 0x850c:
@@ -1270,14 +1212,9 @@ s3_virge_mmio_read_l(uint32_t addr, void *priv) {
 
         case 0x8504:
             ret = 0x0000c000;
-            if (virge->s3d_busy || virge->virge_busy || !FIFO_EMPTY)
-                ret |= 0x00001000;
-            else
-                ret |= 0x00003000;
+            ret |= 0x00003000;
 
             ret |= virge->subsys_stat;
-            if (!virge->virge_busy)
-                wake_fifo_thread(virge);
             break;
 
         case 0x850c:
@@ -1738,105 +1675,46 @@ s3_virge_mmio_write_fifo_l(virge_t *virge, uint32_t addr, uint32_t val)
 }
 
 static void
-fifo_thread(void *param)
-{
-    virge_t *virge = (virge_t *)param;
-
-    while (virge->fifo_thread_run) {
-        thread_set_event(virge->fifo_not_full_event);
-        thread_wait_event(virge->wake_fifo_thread, -1);
-        thread_reset_event(virge->wake_fifo_thread);
-        virge->virge_busy = 1;
-        while (!FIFO_EMPTY) {
-            uint64_t start_time = plat_timer_read();
-            uint64_t end_time;
-            fifo_entry_t *fifo = &virge->fifo[virge->fifo_read_idx & FIFO_MASK];
-            uint32_t val = fifo->val;
-
-            switch (fifo->addr_type & FIFO_TYPE) {
-                case FIFO_WRITE_BYTE:
-                    if (((fifo->addr_type & FIFO_ADDR) & 0xffff) < 0x8000)
-                        s3_virge_bitblt(virge, 8, val);
-                    break;
-                case FIFO_WRITE_WORD:
-                    if (((fifo->addr_type & FIFO_ADDR) & 0xfffe) < 0x8000) {
-                        if (virge->s3d.cmd_set & CMD_SET_MS)
-                            s3_virge_bitblt(virge, 16, ((val >> 8) | (val << 8)) << 16);
-                        else
-                            s3_virge_bitblt(virge, 16, val);
-                    }
-                    break;
-                case FIFO_WRITE_DWORD:
-                    if (((fifo->addr_type & FIFO_ADDR) & 0xfffc) < 0x8000) {
-                        if (virge->s3d.cmd_set & CMD_SET_MS)
-                            s3_virge_bitblt(virge, 32,
-                                            ((val & 0xff000000) >> 24) | ((val & 0x00ff0000) >> 8) |
-                                            ((val & 0x0000ff00) << 8) | ((val & 0x000000ff) << 24));
-                        else
-                            s3_virge_bitblt(virge, 32, val);
-                    } else
-                        s3_virge_mmio_write_fifo_l(virge, (fifo->addr_type & FIFO_ADDR) & 0xfffc, val);
-                    break;
-            }
-
-            virge->fifo_read_idx++;
-            fifo->addr_type = FIFO_INVALID;
-
-             if (FIFO_ENTRIES > 0xe000)
-                 thread_set_event(virge->fifo_not_full_event);
-
-             end_time = plat_timer_read();
-             virge_time += end_time - start_time;
-         }
-         virge->virge_busy = 0;
-         virge->subsys_stat |= INT_FIFO_EMP | INT_3DF_EMP;
-         if (virge->cmd_dma)
-            virge->subsys_stat |= INT_HOST_DONE | INT_CMD_DONE;
-
-         s3_virge_update_irqs(virge);
-    }
-}
-
-static void
 s3_virge_queue(virge_t *virge, uint32_t addr, uint32_t val, uint32_t type)
 {
-    fifo_entry_t *fifo = &virge->fifo[virge->fifo_write_idx & FIFO_MASK];
-    int limit = 0;
+    uint32_t addr_type = (addr & FIFO_ADDR) | type;
+    uint64_t start_time = plat_timer_read();
+    uint64_t end_time;
 
-    if (type == FIFO_WRITE_DWORD) {
-        switch (addr & 0xfffc) {
-            case 0xa500:
-                if (val & CMD_SET_AE)
-                    limit = 1;
-                break;
-            default:
-                break;
-        }
+    switch (addr_type & FIFO_TYPE) {
+        case FIFO_WRITE_BYTE:
+            if (((addr_type & FIFO_ADDR) & 0xffff) < 0x8000)
+                s3_virge_bitblt(virge, 8, val);
+            break;
+        case FIFO_WRITE_WORD:
+            if (((addr_type & FIFO_ADDR) & 0xfffe) < 0x8000) {
+                if (virge->s3d.cmd_set & CMD_SET_MS)
+                    s3_virge_bitblt(virge, 16, ((val >> 8) | (val << 8)) << 16);
+                else
+                    s3_virge_bitblt(virge, 16, val);
+            }
+            break;
+        case FIFO_WRITE_DWORD:
+            if (((addr_type & FIFO_ADDR) & 0xfffc) < 0x8000) {
+                if (virge->s3d.cmd_set & CMD_SET_MS)
+                    s3_virge_bitblt(virge, 32,
+                                    ((val & 0xff000000) >> 24) | ((val & 0x00ff0000) >> 8) |
+                                    ((val & 0x0000ff00) << 8) | ((val & 0x000000ff) << 24));
+                else
+                    s3_virge_bitblt(virge, 32, val);
+            } else
+                s3_virge_mmio_write_fifo_l(virge, (addr_type & FIFO_ADDR) & 0xfffc, val);
+            break;
     }
 
-    if (limit) {
-        if (FIFO_ENTRIES >= 16) {
-            thread_reset_event(virge->fifo_not_full_event);
-            if (FIFO_ENTRIES >= 16)
-                thread_wait_event(virge->fifo_not_full_event, -1); /*Wait for room in ringbuffer*/
-        }
-    } else {
-        if (FIFO_FULL) {
-            thread_reset_event(virge->fifo_not_full_event);
-            if (FIFO_FULL)
-                thread_wait_event(virge->fifo_not_full_event, -1); /*Wait for room in ringbuffer*/
-        }
-    }
+    end_time = plat_timer_read();
+    virge_time += end_time - start_time;
 
-    fifo->val = val;
-    fifo->addr_type = (addr & FIFO_ADDR) | type;
+    virge->subsys_stat |= INT_FIFO_EMP | INT_3DF_EMP;
+    if (virge->cmd_dma)
+        virge->subsys_stat |= INT_HOST_DONE | INT_CMD_DONE;
 
-    virge->fifo_write_idx++;
-
-    if (FIFO_ENTRIES > 0xe000)
-        wake_fifo_thread(virge);
-    if (FIFO_ENTRIES > 0xe000 || FIFO_ENTRIES < 8)
-        wake_fifo_thread(virge);
+    s3_virge_update_irqs(virge);
 }
 
 static void
@@ -3621,39 +3499,11 @@ s3_virge_triangle(virge_t *virge, s3d_t *s3d_tri) {
 }
 
 static void
-render_thread(void *param)
-{
-    virge_t *virge = (virge_t *)param;
-
-    while (virge->render_thread_run) {
-        thread_wait_event(virge->wake_render_thread, -1);
-        thread_reset_event(virge->wake_render_thread);
-        virge->s3d_busy = 1;
-        while (!RB_EMPTY) {
-            s3_virge_triangle(virge, &virge->s3d_buffer[virge->s3d_read_idx & RB_MASK]);
-            virge->s3d_read_idx++;
-
-            if (RB_ENTRIES == RB_MASK)
-                thread_set_event(virge->not_full_event);
-        }
-        virge->s3d_busy = 0;
-        virge->subsys_stat |= INT_S3D_DONE;
-        s3_virge_update_irqs(virge);
-    }
-}
-
-static void
 queue_triangle(virge_t *virge)
 {
-    if (RB_FULL) {
-        thread_reset_event(virge->not_full_event);
-        if (RB_FULL)
-            thread_wait_event(virge->not_full_event, -1); /*Wait for room in ringbuffer*/
-    }
-    virge->s3d_buffer[virge->s3d_write_idx & RB_MASK] = virge->s3d_tri;
-    virge->s3d_write_idx++;
-    if (!virge->s3d_busy)
-        thread_set_event(virge->wake_render_thread); /*Wake up render thread if moving from idle*/
+    s3_virge_triangle(virge, &virge->s3d_tri);
+    virge->subsys_stat |= INT_S3D_DONE;
+    s3_virge_update_irqs(virge);
 }
 
 static void s3_virge_hwcursor_draw(svga_t *svga, int displine) {
@@ -4315,12 +4165,6 @@ s3_virge_reset(void *priv)
 
     if (reset_state != NULL) {
         s3_virge_disable_handlers(dev);
-        dev->virge_busy = 0;
-        dev->fifo_write_idx = 0;
-        dev->fifo_read_idx = 0;
-        dev->s3d_busy = 0;
-        dev->s3d_write_idx = 0;
-        dev->s3d_read_idx = 0;
         reset_state->pci_slot = dev->pci_slot;
 
         *dev = *reset_state;
@@ -4566,17 +4410,6 @@ s3_virge_init(const device_t *info)
 
     virge->svga.force_old_addr = 1;
 
-    virge->render_thread_run = 1;
-    virge->wake_render_thread = thread_create_event();
-    virge->wake_main_thread = thread_create_event();
-    virge->not_full_event = thread_create_event();
-    virge->render_thread = thread_create(render_thread, virge);
-
-    virge->fifo_thread_run = 1;
-    virge->wake_fifo_thread = thread_create_event();
-    virge->fifo_not_full_event = thread_create_event();
-    virge->fifo_thread = thread_create(fifo_thread, virge);
-
     virge->local = info->local;
 
     *reset_state = *virge;
@@ -4588,19 +4421,6 @@ static void
 s3_virge_close(void *priv)
 {
     virge_t *virge = (virge_t *) priv;
-
-    virge->render_thread_run = 0;
-    thread_set_event(virge->wake_render_thread);
-    thread_wait(virge->render_thread);
-    thread_destroy_event(virge->not_full_event);
-    thread_destroy_event(virge->wake_main_thread);
-    thread_destroy_event(virge->wake_render_thread);
-
-    virge->fifo_thread_run = 0;
-    thread_set_event(virge->wake_fifo_thread);
-    thread_wait(virge->fifo_thread);
-    thread_destroy_event(virge->fifo_not_full_event);
-    thread_destroy_event(virge->wake_fifo_thread);
 
     svga_close(&virge->svga);
 

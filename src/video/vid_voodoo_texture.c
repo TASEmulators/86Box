@@ -288,8 +288,6 @@ voodoo_use_texture(voodoo_t *voodoo, voodoo_params_t *params, int tmu)
             if (voodoo->texture_cache[tmu][voodoo->texture_last_removed].refcount == voodoo->texture_cache[tmu][voodoo->texture_last_removed].refcount_r[0] && (voodoo->render_threads == 1 || voodoo->texture_cache[tmu][voodoo->texture_last_removed].refcount == voodoo->texture_cache[tmu][voodoo->texture_last_removed].refcount_r[1]))
                 break;
         }
-        if (c == TEX_CACHE_MAX)
-            voodoo_wait_for_render_thread_idle(voodoo);
     } while (c == TEX_CACHE_MAX);
     if (c == TEX_CACHE_MAX)
         fatal("Texture cache full!\n");
@@ -588,8 +586,6 @@ flush_texture_cache(voodoo_t *voodoo, uint32_t dirty_addr, int tmu)
             }
         }
     }
-    if (wait_for_idle)
-        voodoo_wait_for_render_thread_idle(voodoo);
 }
 
 void

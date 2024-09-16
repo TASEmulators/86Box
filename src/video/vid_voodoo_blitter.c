@@ -169,8 +169,6 @@ voodoo_v2_blit_start(voodoo_t *voodoo)
                   voodoo->bltCommand, voodoo->bltSrcX, voodoo->bltSrcY, voodoo->bltDstX, voodoo->bltDstY, voodoo->bltSizeX, voodoo->bltSizeY, voodoo->bltColorFg, voodoo->bltColorBg);
 #endif
 
-    voodoo_wait_for_render_thread_idle(voodoo);
-
     switch (voodoo->bltCommand & BLIT_COMMAND_MASK) {
         case BLIT_COMMAND_SCREEN_TO_SCREEN:
             for (int y = 0; y <= size_y; y++) {
