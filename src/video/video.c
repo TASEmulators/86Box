@@ -238,13 +238,7 @@ typedef struct blit_data_struct {
     int x, y, w, h;
     int busy;
     int buffer_in_use;
-    int thread_run;
     int monitor_index;
-
-    thread_t *blit_thread;
-    event_t  *wake_blit_thread;
-    event_t  *blit_complete;
-    event_t  *buffer_not_in_use;
 } blit_data_t;
 
 static uint32_t cga_2_table[16];
@@ -278,30 +272,16 @@ video_setblit(void (*blit)(int, int, int, int, int))
 void
 video_blit_complete_monitor(int monitor_index)
 {
-    blit_data_t *blit_data_ptr   = monitors[monitor_index].mon_blit_data_ptr;
-    blit_data_ptr->buffer_in_use = 0;
-
-    thread_set_event(blit_data_ptr->buffer_not_in_use);
 }
 
 void
 video_wait_for_blit_monitor(int monitor_index)
 {
-    blit_data_t *blit_data_ptr = monitors[monitor_index].mon_blit_data_ptr;
-
-    while (blit_data_ptr->busy)
-        thread_wait_event(blit_data_ptr->blit_complete, -1);
-    thread_reset_event(blit_data_ptr->blit_complete);
 }
 
 void
 video_wait_for_buffer_monitor(int monitor_index)
 {
-    blit_data_t *blit_data_ptr = monitors[monitor_index].mon_blit_data_ptr;
-
-    while (blit_data_ptr->buffer_in_use)
-        thread_wait_event(blit_data_ptr->buffer_not_in_use, -1);
-    thread_reset_event(blit_data_ptr->buffer_not_in_use);
 }
 
 static png_structp png_ptr[MONITORS_NUM];
@@ -441,25 +421,6 @@ video_transform_copy(void *__restrict _Dst, const void *__restrict _Src, size_t 
     return _Dst;
 }
 
-static void
-blit_thread(void *param)
-{
-    blit_data_t *data = param;
-    while (data->thread_run) {
-        thread_wait_event(data->wake_blit_thread, -1);
-        thread_reset_event(data->wake_blit_thread);
-        MTR_BEGIN("video", "blit_thread");
-
-        if (blit_func)
-            blit_func(data->x, data->y, data->w, data->h, data->monitor_index);
-
-        data->busy = 0;
-
-        MTR_END("video", "blit_thread");
-        thread_set_event(data->blit_complete);
-    }
-}
-
 void
 video_blit_memtoscreen_monitor(int x, int y, int w, int h, int monitor_index)
 {
@@ -468,16 +429,8 @@ video_blit_memtoscreen_monitor(int x, int y, int w, int h, int monitor_index)
     if ((w <= 0) || (h <= 0))
         return;
 
-    video_wait_for_blit_monitor(monitor_index);
+    blit_func(x, y, w, h, monitor_index);
 
-    monitors[monitor_index].mon_blit_data_ptr->busy          = 1;
-    monitors[monitor_index].mon_blit_data_ptr->buffer_in_use = 1;
-    monitors[monitor_index].mon_blit_data_ptr->x             = x;
-    monitors[monitor_index].mon_blit_data_ptr->y             = y;
-    monitors[monitor_index].mon_blit_data_ptr->w             = w;
-    monitors[monitor_index].mon_blit_data_ptr->h             = h;
-
-    thread_set_event(monitors[monitor_index].mon_blit_data_ptr->wake_blit_thread);
     MTR_END("video", "video_blit_memtoscreen");
 }
 
@@ -859,10 +812,6 @@ video_monitor_init(int index)
     monitors[index].mon_changeframecount                 = 2;
     monitors[index].target_buffer                        = create_bitmap(2048, 2048);
     monitors[index].mon_blit_data_ptr                    = calloc(1, sizeof(blit_data_t));
-    monitors[index].mon_blit_data_ptr->wake_blit_thread  = thread_create_event();
-    monitors[index].mon_blit_data_ptr->blit_complete     = thread_create_event();
-    monitors[index].mon_blit_data_ptr->buffer_not_in_use = thread_create_event();
-    monitors[index].mon_blit_data_ptr->thread_run        = 1;
     monitors[index].mon_blit_data_ptr->monitor_index     = index;
     monitors[index].mon_pal_lookup                       = calloc(sizeof(uint32_t), 256);
     monitors[index].mon_cga_palette                      = calloc(1, sizeof(int));
@@ -872,7 +821,6 @@ video_monitor_init(int index)
     atomic_init(&monitors[index].mon_screenshots, 0);
     if (index >= 1)
         ui_init_monitor(index);
-    monitors[index].mon_blit_data_ptr->blit_thread = thread_create(blit_thread, monitors[index].mon_blit_data_ptr);
 }
 
 void
@@ -881,15 +829,8 @@ video_monitor_close(int monitor_index)
     if (monitors[monitor_index].target_buffer == NULL) {
         return;
     }
-    monitors[monitor_index].mon_blit_data_ptr->thread_run = 0;
-    thread_set_event(monitors[monitor_index].mon_blit_data_ptr->wake_blit_thread);
-    thread_wait(monitors[monitor_index].mon_blit_data_ptr->blit_thread);
     if (monitor_index >= 1)
         ui_deinit_monitor(monitor_index);
-    thread_destroy_event(monitors[monitor_index].mon_blit_data_ptr->buffer_not_in_use);
-    thread_destroy_event(monitors[monitor_index].mon_blit_data_ptr->blit_complete);
-    thread_destroy_event(monitors[monitor_index].mon_blit_data_ptr->wake_blit_thread);
-    free(monitors[monitor_index].mon_blit_data_ptr);
     if (!monitors[monitor_index].mon_pal_lookup_static)
         free(monitors[monitor_index].mon_pal_lookup);
     if (!monitors[monitor_index].mon_cga_palette_static)
