@@ -119,7 +119,7 @@ main_thread_fn()
             uint64_t start_time = elapsed_timer.nsecsElapsed();
 #endif
             /* Run a block of code. */
-            pc_run();
+            pc_run(10);
 
 #ifdef USE_INSTRUMENT
             if (instru_enabled) {
